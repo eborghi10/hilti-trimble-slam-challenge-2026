@@ -1,0 +1,31 @@
+%YAML:1.0
+
+# loop_fusion configuration for Hilti Challenge (OpenVINS backend)
+
+# Camera calibration (camodocal KANNALA_BRANDT format, relative to this file)
+cam0_calib: "cam0_calib.yaml"
+
+# Image topic (raw camera images — loop_fusion syncs by timestamp with keyframe data)
+image0_topic: "/cam0/image_raw"
+
+# Image dimensions
+image_width: 1472
+image_height: 1440
+
+# Pose graph output
+pose_graph_save_path: "/ros2_ws/results/pose_graph/"
+output_path: "/ros2_ws/results"
+
+# Save debug images (loop closure matches)
+save_image: 0
+
+# Whether to load a previously saved pose graph
+load_previous_pose_graph: 0
+
+# IMU flag (1 = VIO input has IMU, affects 4-DoF vs 6-DoF optimization)
+imu: 1
+
+# Frame IDs for TF publishing
+world_frame_id: "map"
+body_frame_id: "imu"
+camera_frame_id: "cam0"

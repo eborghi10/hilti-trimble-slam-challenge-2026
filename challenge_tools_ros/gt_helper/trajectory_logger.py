@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import TransformStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry
 from tf2_ros import TransformException
 import tf2_ros
 from rclpy.duration import Duration
@@ -17,14 +18,20 @@ from challenge_tools_lib import ReactTime
 from challenge_tools_lib import ChallengeToolsLib
 
 class GTPub(Node):
-    def __init__(self, output_filename):
+    def __init__(self, output_filename, topic="/ov_msckf/poseimu"):
         super().__init__('trajectory_logger')
         self.fixed_frame = "map"
 
-        self.subscription2 = self.create_subscription(PoseWithCovarianceStamped, "/ov_msckf/poseimu", self.pose_callback, 10)
-
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        if topic == "/ov_msckf/poseimu":
+            # Original TF-based approach (used for Phase 1 baseline)
+            self.subscription2 = self.create_subscription(PoseWithCovarianceStamped, topic, self.pose_callback, 10)
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        else:
+            # Direct Odometry subscription (for loop_fusion /odometry_rect, etc.)
+            self.subscription2 = self.create_subscription(Odometry, topic, self.odom_callback, 10)
+            self.tf_buffer = None
+            self.tf_listener = None
 
         self.ctl = ChallengeToolsLib()
         self.ctl.fixed_frame = self.fixed_frame
@@ -99,6 +106,17 @@ class GTPub(Node):
 
         return
 
+    def odom_callback(self, msg):
+        t = msg.header.stamp
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        this_time = ReactTime(t.sec, t.nanosec)
+        this_pose = ReactPose(
+            [p.x, p.y, p.z],
+            [q.x, q.y, q.z, q.w]
+        )
+        self.write_line_to_file((this_time, this_pose))
+
 
 
 def main(args=None):
@@ -106,14 +124,16 @@ def main(args=None):
 
     cli_args = sys.argv[1:]
     if len(cli_args) < 1:
-        print("Usage: trajectory_logger.py <output_filename.txt>")
+        print("Usage: trajectory_logger.py <output_filename.txt> [topic]")
         print("  output_filename.txt: TUM-format output file (e.g., floor_1_2025-05-05_run_1.txt)")
+        print("  topic: (optional) odometry topic (default: /ov_msckf/poseimu)")
         rclpy.shutdown()
         return
 
     output_filename = cli_args[0]
+    topic = cli_args[1] if len(cli_args) > 1 else "/ov_msckf/poseimu"
 
-    app = GTPub(output_filename)
+    app = GTPub(output_filename, topic)
     rclpy.spin(app)
     app.destroy_node()
     rclpy.shutdown()

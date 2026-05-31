@@ -1,0 +1,435 @@
+# Hilti x Trimble SLAM Challenge 2026 - Implementation Plan
+
+## Resources
+
+- **Challenge webpage**: https://hilti-trimble-challenge.com/
+- **Dataset (Google Drive)**: https://drive.google.com/drive/folders/1ZiQHwcoF6NGo8lAW9kmqMgqMYQuQcxKZ
+
+---
+
+## Goal
+
+Participate in both challenge tasks using an extended **Hilti OpenVINS** pipeline:
+
+| Task | Description | Max Score |
+|---|---|---|
+| **SLAM** | Estimate camera trajectory in any reference frame | 2500 pts (25 runs) |
+| **Localization** | Estimate trajectory in floorplan coordinate frame | 2400 pts (24 runs) |
+
+---
+
+## System Architecture
+
+```
+Insta360 ROS2 bag
+  ├── /cam0, /cam1  (fisheye 1472x1440, 30 Hz)
+  └── /imu/data_raw (6-axis IMU, 1000 Hz)
+         |
+         v
+  Hilti OpenVINS  [Hilti-Research/open_vins]
+  - EUCM camera model (accurate wide-FOV fisheye)
+  - Rolling shutter correction (rs_config.yaml)
+  - ROS2 native
+         |  publishes odometry + keyframe images
+         v
+  loop_fusion  [zinuok/VINS-Fusion-ROS2]      floorplan_localizer  [NEW]
+  - DBoW2 place recognition (deterministic)    - OccupancyGrid from PNG floorplan
+  - SuperPoint ONNX + E-mat verification (C++) - Anchor to GT pose at t=10005s
+  - Ceres pose graph optimizer                 - Free-space constraint optimization
+  - publishes /loop_fusion/odometry_rect       - publishes /floorplan/pose_corrected
+         |                                            |
+         +--------------------+-----------------------+
+                              |
+                              v
+                    trajectory_logger.py
+                    -> floor_X_YYYY-MM-DD_run_Z.txt  (TUM format)
+                    -> submit to hilti-trimble-challenge.com
+```
+
+---
+
+## Key Design Decisions
+
+### Camera Model: EUCM
+The Insta360 uses fisheye lenses with ~200° FOV per lens. The **Enhanced Unified Camera Model (EUCM)** is more accurate than pinhole+equidistant for such wide angles. Hilti's fork of OpenVINS adds native EUCM support. A fitted pinhole-equidistant calibration is also available for compatibility.
+
+### Loop Closure: DBoW2 + LightGlue (hybrid)
+- **DBoW2**: Bag-of-Words image retrieval using BRIEF vocabulary (`brief_k10L6.bin`).
+  Finds loop candidates quickly — confirmed working on fisheye images.
+- **LightGlue**: Learned feature matcher (SuperPoint detector + LightGlue matcher).
+  Replaces BRIEF for geometric verification of loop candidates only. Invariant to
+  extreme viewpoint changes (60–154° yaw) and fisheye distortion.
+- **Pose graph**: Ceres-based 4-DoF optimizer from VINS-Fusion (yaw + translation).
+- **Loose coupling**: `loop_fusion` subscribes to OpenVINS pose + keyframe topics.
+  LightGlue runs as a Python ROS2 service called only for DBoW2 candidates (~5–20/run).
+
+### GPU Strategy
+
+| Component | CPU | GPU |
+|---|---|---|
+| OpenVINS feature tracking | CPU OpenCV | CUDA OpenCV (same results) |
+| DBoW2 place recognition | deterministic, fast | N/A |
+| SuperPoint ONNX (loop closure) | N/A | **3-5 ms/frame** (ONNX Runtime CUDA EP) |
+| BFMatcher + E-mat RANSAC | <1 ms/pair | N/A |
+| Ceres pose graph | deterministic | N/A |
+
+Docker base: `nvidia/cuda:11.8.0-devel-ubuntu22.04`. GPU is optional at runtime (`--gpus all`).
+
+### Floorplan Localization
+- Provided floorplans (PNG) converted to ROS2 OccupancyGrid via `map_server.py`
+- Initial GT camera pose provided at t≈10005s (5 sec after recording start)
+- 2D ICP or distance-transform scan-matching corrects x,y drift against wall geometry
+- z-coordinate: pass-through from OpenVINS (not evaluated in Localization task)
+- Floorplan accuracy: ~1cm; as-built deviations expected — robust matching required
+
+---
+
+## Repository Stack
+
+| Repo | Branch/Tag | Role |
+|---|---|---|
+| [`Hilti-Research/open_vins`](https://github.com/Hilti-Research/open_vins) | `main` | VIO core with EUCM + RS + ROS2 |
+| [`zinuok/VINS-Fusion-ROS2`](https://github.com/zinuok/VINS-Fusion-ROS2) | `main` | `loop_fusion` + `camera_models` packages |
+| [`hilti-trimble-slam-challenge-2026`](https://github.com/Hilti-Research/hilti-trimble-slam-challenge-2026) | `main` | Challenge tools, config, floorplans |
+
+---
+
+## Implementation Phases
+
+### Phase 0: Development Environment ✓ *completed*
+- **Base image**: `nvidia/cuda:11.8.0-devel-ubuntu22.04` + ROS2 Humble
+- **Setup**: VS Code devcontainer (see `.devcontainer/devcontainer.json`)
+- **OpenCV**: `libopencv-dev` from apt (compatible with `ros-humble-cv-bridge`)
+- **Ceres**: Built from source v2.2.0 (camera_models requires Manifold API not in apt 2.0)
+- **Packages built**: `open_vins`, `loop_fusion`, `camera_models`, `challenge_tools_ros`
+- **DBoW2 vocabulary**: `brief_k10L6.bin` pre-downloaded to `/ros2_ws/support_files/`
+- **Run command** (if using Docker directly):
+  ```bash
+  docker run -it --rm --gpus all \
+    -v /path/to/data:/data \
+    hilti-slam-challenge:cuda
+  ```
+
+### Phase 1: Baseline - OpenVINS ✓ *completed*
+- Run Hilti OpenVINS with EUCM model on early-release run `floor_1_2025-05-05_run_1`
+- Enable rolling shutter correction via `rs_config.yaml`
+- Log trajectory with `trajectory_logger.py` → TUM format
+- Compute ATE vs. provided ground truth (5 early-release runs have GT)
+- **Result**: RMSE = 0.191 m, mean = 0.178 m over 169 m traversed (3973 poses, ~70 Hz)
+
+```bash
+# Terminal 1: OpenVINS (no RViz for headless)
+ros2 launch challenge_tools_ros run_openvins.launch.py \
+  rviz_enable:=false save_total_state:=false
+
+# Terminal 2: Trajectory logger
+python3 /ros2_ws/install/challenge_tools_ros/lib/challenge_tools_ros/trajectory_logger.py \
+  /ros2_ws/results/floor_1_2025-05-05_run_1_estimated.txt
+
+# Terminal 3: Play bag
+ros2 bag play /data/2025-05-05/run_1/rosbag
+
+# Terminal 4: Evaluate
+evo_ape tum groundtruth/floor_1_2025-05-05_run_1.txt \
+  /ros2_ws/results/floor_1_2025-05-05_run_1_estimated.txt \
+  --align --correct_scale
+```
+
+> **Note**: For ROS2 Humble, fix each bag's `metadata.yaml`:
+> replace `offered_qos_profiles: []` with `offered_qos_profiles: ""`
+>
+> **Note**: OpenVINS fork (`eborghi10/open_vins`) patches:
+> - TF frame `"global"` → `"map"` (matches `trajectory_logger.py` expectations)
+> - TF stamp uses bag timestamp instead of `_node->now()` (fixes extrapolation errors during bag replay)
+>
+> **Note**: OpenVINS uses **static initialization** — requires the sensor to be stationary
+> for the first ~1 second of data. When replaying bags, play at **0.5x rate** with a
+> **6-second delay** before starting loop_fusion/other nodes to ensure reliable init.
+> Without this, VIO fails silently (outputs garbage poses or never converges).
+
+### Phase 2: Loop Closure ✓ *completed — SuperPoint ONNX C++ replaces BRIEF*
+
+**Rationale**: OpenVINS is a VIO (Visual-Inertial Odometry) system — it accumulates drift
+over time because it has no mechanism to recognize previously visited places. Adding loop
+closure via `loop_fusion` (from VINS-Fusion-ROS2) corrects accumulated drift by detecting
+revisited locations and optimizing a pose graph. This is a **loose coupling** approach:
+loop_fusion subscribes to OpenVINS outputs and publishes a drift-corrected trajectory
+without modifying OpenVINS internals.
+
+#### Topic Remapping (verified from source)
+
+| OpenVINS topic | loop_fusion subscription | Message type |
+|---|---|---|
+| `/ov_msckf/odomimu` | `/vins_estimator/odometry` | `nav_msgs/Odometry` |
+| `/ov_msckf/loop_pose` | `/vins_estimator/keyframe_pose` | `nav_msgs/Odometry` |
+| `/ov_msckf/loop_feats` | `/vins_estimator/keyframe_point` | `sensor_msgs/PointCloud` |
+| `/ov_msckf/loop_extrinsic` | `/vins_estimator/extrinsic` | `nav_msgs/Odometry` |
+| `/cam0/image_raw` | `image0_topic` (from config) | `sensor_msgs/Image` |
+
+#### Gaps and Caveats
+
+1. **`/vins_estimator/margin_cloud`** — loop_fusion subscribes but OpenVINS never publishes
+   this. Verified non-critical: the callback only applies drift correction for visualization
+   republishing. No impact on loop detection or pose graph optimization.
+
+2. **Normalized coordinates are zeros** — OpenVINS publishes `loop_feats` with normalized
+   image coordinates set to `(0, 0)` (comment in source: *"they will have to be
+   re-normalized in the loop closure code"*). **Verified non-issue**: the only code that
+   reads `point_2d_norm` is `FundmantalMatrixRANSAC` which is commented out in
+   `keyframe.cpp`. PnP verification uses `matched_2d_old_norm` from `liftProjective()` on
+   BRIEF features in the old keyframe image — independent of these zeros.
+
+3. **Camera calibration format** — loop_fusion uses `camodocal` library which supports
+   `KANNALA_BRANDT` (equidistant) model. The existing kalibr calibration
+   (`pinhole+equidistant`) maps directly to this format.
+
+#### Steps
+- Create `config/hilti_loop_fusion/` with loop_fusion config YAML + camodocal camera YAML ✓
+- Create `launch/run_loop_fusion.launch.py` with topic remappings ✓
+- Symlink `/ros2_ws/support_files/` into install tree for vocabulary + BRIEF pattern ✓
+- Fix `pose_graph_node.cpp` argc handling for `ros2 launch` compatibility ✓
+- Verify PnP code path re: normalized coordinates ✓ (not an issue)
+- Rebuild loop_fusion and run end-to-end test on `floor_1_2025-05-05_run_1` ✓
+- Measure ATE improvement vs. Phase 1 baseline (RMSE 0.193 m) ✓
+
+#### Findings: BRIEF Descriptors Incompatible with 200° FOV Fisheye
+
+loop_fusion's geometric verification pipeline **fundamentally fails** on the Insta360
+fisheye images because **BRIEF descriptors are NOT rotation- or distortion-invariant**.
+DBoW2 vocabulary matching still finds candidate loop frames (correct place recognition),
+but the subsequent feature matching produces geometrically incorrect correspondences,
+making PnP pose estimation unreliable.
+
+**Approaches tested:**
+
+| Approach | Loop Closures | RMSE | Outcome |
+|---|---|---|---|
+| Baseline (VIO only, no loop closure) | — | 0.193 m | reference |
+| PnP RANSAC (original pipeline) | 0 | — | PnP solutions wrong (5–40° yaw error, 5 m translation) |
+| Essential Matrix (cv::findEssentialMat) | — | — | Degenerate: 100% inlier rate always (wide-FOV satisfies any epipolar geometry) |
+| VIO-relative constraint, 5 m threshold | 13 | 0.184 m | Best BRIEF result (4.7% improvement) |
+| VIO-relative constraint, 2.5 m threshold | 4 | 0.229 m | Too few loops, less error averaging |
+| Zero-translation constraint | 7 | 0.449 m | Harmful — forces non-colocated frames together |
+| **SuperPoint ONNX + E-mat (Phase 2B)** | **5** | **0.064 m** | **66.8% improvement over baseline** |
+
+**Root causes:**
+- BRIEF is a binary descriptor based on fixed pixel-pair intensity comparisons. On heavily
+  distorted fisheye images with large viewpoint rotation between revisits (60–154° yaw),
+  the same scene patch maps to entirely different BRIEF bit patterns.
+- Cross-check matching + Hamming threshold (80) still produces 30–50 mutual matches,
+  but these are mostly incorrect correspondences (random patches that happen to be similar).
+- `cv::findEssentialMat` is degenerate for wide-FOV: any set of points across a 200°
+  field always admits a valid epipolar geometry, so inlier ratio is meaningless.
+- PnP (`cv::solvePnP` with ITERATIVE/AP3P) produces wildly wrong solutions because
+  the input 2D–3D correspondences are incorrect.
+
+**VIO-relative workaround (current best):**
+Skip geometric verification entirely. Use VIO proximity (distance between VIO poses of
+current and candidate frames) as the acceptance criterion. When accepted, use the VIO
+relative pose as the loop constraint. This provides marginal improvement because the
+direct VIO measurement between distant frames differs slightly from accumulated sequential
+odometry (numerical integration drift, marginalization effects).
+
+#### Run Command (Phase 2 pipeline)
+
+```bash
+# Must play at 0.5x rate for reliable static initialization
+pkill -f "run_subscribe_msckf\|loop_fusion\|ros2.bag"
+rm -f /ros2_ws/results/vio_loop.csv
+source /ros2_ws/install/setup.bash
+
+ros2 launch challenge_tools_ros run_openvins.launch.py \
+  max_cameras:=1 use_stereo:=false dosave_pose:=false rviz:=false &
+sleep 6
+
+ros2 launch challenge_tools_ros run_loop_fusion.launch.py &
+sleep 6
+
+ros2 bag play /path/to/rosbag --rate 0.5
+
+# Evaluate: convert vio_loop.csv (ns,x,y,z,qw,qx,qy,qz) → TUM (s x y z qx qy qz qw)
+python3 -c "
+import sys
+with open('/ros2_ws/results/vio_loop.csv') as fin, open('/tmp/vio_loop_tum.txt', 'w') as fout:
+    for line in fin:
+        parts = line.strip().rstrip(',').split(',')
+        if len(parts) < 8: continue
+        ts_s = float(parts[0]) / 1e9
+        x, y, z = parts[1], parts[2], parts[3]
+        qw, qx, qy, qz = parts[4], parts[5], parts[6], parts[7]
+        fout.write(f'{ts_s:.9f} {x} {y} {z} {qx} {qy} {qz} {qw}\n')
+"
+
+evo_ape tum groundtruth/floor_1_2025-05-05_run_1.txt /tmp/vio_loop_tum.txt \
+  --align --correct_scale -r trans_part
+```
+
+#### Decision: C++ SuperPoint ONNX + Mutual NN Matching (in-process)
+
+**Chosen approach**: Replace BRIEF-based geometric verification with SuperPoint CNN
+features extracted via ONNX Runtime (GPU), matched with mutual nearest-neighbor + Lowe's
+ratio test, and verified with Essential matrix RANSAC. All in C++ within loop_fusion —
+no Python bridge, no inter-process latency.
+
+**Why C++ ONNX over Python LightGlue service:**
+- *Zero IPC overhead*: Feature extraction + matching happens in the same process as
+  pose graph optimization. No ROS2 service call latency (~300ms round-trip eliminated).
+- *Deterministic pipeline*: No Python GIL, no async service timing issues.
+- *Simpler deployment*: Single binary, no Python environment in Docker.
+- *Fast enough*: SuperPoint ONNX inference 3-5ms on GPU + BFMatcher 0.5ms = total <10ms.
+  LightGlue's adaptive matching is overkill when mutual NN + E-matrix already works.
+
+**Architecture (implemented):**
+```
+loop_fusion (C++) — single process
+  │
+  ├─ DBoW2 detects loop candidate (BRIEF vocabulary, unchanged)
+  ├─ SuperPointONNX::extract() on both keyframe images (CUDA EP, 3-5ms each)
+  │    └─ Resize to 480p → normalize → ONNX inference → NMS → top-1024 keypoints
+  ├─ SuperPointONNX::matchDescriptors() — BFMatcher L2 + mutual NN + ratio test 0.9
+  ├─ cv::findEssentialMat() with RANSAC on normalized keypoints (via camodocal liftProjective)
+  ├─ Accept if inliers ≥ 20 AND VIO distance < threshold (adaptive: 50m if ratio>0.4, else 20m)
+  ├─ Use VIO relative pose as loop constraint (metric scale from IMU)
+  └─ Ceres 4-DoF pose graph optimization
+```
+
+**Key parameters:**
+- `max_keypoints = 1024`, `input_size = 480`, `nms_radius = 4`, `score_threshold = 0.005`
+- `ratio_threshold = 0.9` (Lowe's ratio test), mutual cross-check enabled
+- `MIN_SUPERPOINT_INLIERS = 20` (Essential matrix RANSAC threshold)
+- VIO distance threshold: adaptive (50m for inlier_ratio > 0.4, 20m otherwise)
+- Virtual pinhole focal = 460 for Essential matrix (after camodocal normalization)
+
+#### Phase 2B Results ✓ *completed*
+
+**SuperPoint ONNX C++ integration** — tested on `floor_1_2025-05-05_run_1` (134s, 87m):
+
+| Approach | Loop Closures | RMSE | Improvement |
+|---|---|---|---|
+| VIO only (no loop closure) | — | 0.193 m | baseline |
+| BRIEF + VIO-proximity (5m) | 13 | 0.184 m | 4.7% |
+| **SuperPoint ONNX + E-mat** | **5** | **0.064 m** | **66.8%** |
+
+Loop closures accepted:
+- Frame 88 ↔ 24: 20/71 inliers, dist=15.78m, yaw=175.1°
+- Frame 90 ↔ 24: 24/65 inliers, dist=16.69m, yaw=-177.4°
+- Frame 91 ↔ 26: 26/73 inliers, dist=18.05m, yaw=-173.3°
+- Frame 93 ↔ 9: 24/63 inliers, dist=14.40m, yaw=-157.4°
+- Frame 94 ↔ 27: 22/60 inliers, dist=19.63m, yaw=-158.4°
+
+All loop closures involve **~170° yaw change** (robot revisiting corridors from
+opposite direction) — exactly the failure mode for BRIEF. SuperPoint's rotation-invariant
+learned features handle this correctly.
+
+**Files modified/created:**
+- `open_vins/loop_fusion/src/superpoint_onnx.h` — SuperPointONNX class header
+- `open_vins/loop_fusion/src/superpoint_onnx.cpp` — ONNX inference + NMS + matching
+- `open_vins/loop_fusion/src/keyframe.h` — added SP data members + findConnectionSuperPoint()
+- `open_vins/loop_fusion/src/keyframe.cpp` — SP feature extraction + E-mat verification
+- `open_vins/loop_fusion/src/pose_graph.cpp` — USE_SUPERPOINT dispatch
+- `open_vins/loop_fusion/src/pose_graph_node.cpp` — auto-detect model + init CUDA EP
+- `open_vins/loop_fusion/src/parameters.h` — extern declarations
+- `open_vins/loop_fusion/CMakeLists.txt` — ONNX Runtime linking
+- `hilti-challenge/Dockerfile` — libcudnn8 + ONNX Runtime 1.17.1 GPU + model export
+- `hilti-challenge/scripts/export_superpoint_onnx.py` — PyTorch → ONNX export script
+
+**Dependencies added:**
+- ONNX Runtime 1.17.1 GPU (C++ library, ~200MB)
+- cuDNN 8 (required by ORT CUDA EP)
+- SuperPoint ONNX model (5MB, exported during Docker build)
+
+#### Implementation Steps (Phase 2B)
+
+- [x] Export SuperPoint backbone to ONNX (score map + descriptor map, dynamic H/W)
+- [x] Implement C++ SuperPointONNX class (ONNX Runtime CUDA EP, NMS, top-K, bilinear sampling)
+- [x] Implement mutual NN matching with Lowe's ratio test (BFMatcher L2 + cross-check)
+- [x] Integrate into keyframe.cpp: extract on construction, match in findConnectionSuperPoint()
+- [x] Essential matrix RANSAC with camodocal-normalized keypoints for geometric verification
+- [x] Adaptive VIO distance threshold (high inlier ratio → allow larger distances)
+- [x] Update CMakeLists.txt with ONNX Runtime discovery and linking
+- [x] Update Dockerfile: cuDNN, ONNX Runtime download, model export during build
+- [x] Benchmark on floor_1_2025-05-05_run_1: **RMSE 0.064m** (vs 0.184m baseline)
+- [ ] Test on longer sequences (floor_2, floor_UG1) where drift accumulates more
+- [ ] Profile GPU memory usage (SuperPoint ONNX ~100MB + OpenVINS tracking)
+
+#### TODO (housekeeping)
+- Eliminate `support_files` symlink: install vocabulary + BRIEF pattern via CMakeLists.txt
+  with a fallback path so the build works both inside Docker and in a local workspace
+
+### Phase 3: Floorplan Localizer
+
+#### 3A: Rigid Transform ✓ *completed*
+- Implement `floorplan_localizer` ROS2 node in C++ (`src/floorplan_localizer.cpp`)
+- Subscribe to `/loop_fusion/odometry_rect` (or `/ov_msckf/odomimu` if running without loop_fusion)
+- At t=10005s, capture VIO pose and compute rigid transform `T_floorplan←vio` using
+  the challenge-provided GT anchor pose from `init_gt_poses.csv`
+- Account for IMU→camera extrinsic (`T_cam_imu` from kalibr_imucam_chain.yaml):
+  GT anchor is in cam0 frame, VIO publishes in IMU frame
+- Apply `T_floorplan←vio` to all subsequent (and buffered prior) VIO poses
+- Publish corrected poses on `/floorplan/pose_corrected` (nav_msgs/Odometry)
+- Output trajectory in floorplan frame (meters, origin = floorplan image bottom-left)
+- Log to TUM file for submission
+
+**Result** (floor_1_2025-05-05_run_1, 134 s, 169 m traversed):
+
+| Metric | RMSE | Mean | Max |
+|---|---|---|---|
+| Without alignment (Localization task) | **0.611 m** | 0.533 m | 1.209 m |
+| With alignment (SLAM task reference) | 0.310 m | 0.284 m | 0.939 m |
+| Phase 1 VIO baseline (align+scale) | 0.191 m | 0.178 m | — |
+
+The gap between unaligned (0.61 m) and aligned (0.31 m) is VIO drift growing from
+the anchor point. Phase 3B aims to reduce this using floorplan geometry constraints.
+
+#### 3B: Free-space constraint optimization (drift correction)
+- Load floorplan PNG → binary occupancy grid + distance transform (cv2.distanceTransform)
+- After bag completes (or on a sliding window), optimize a smooth time-varying correction
+  `δ(t) = [δx, δy, δyaw]` parameterized as a cubic spline over time
+- Cost function:
+  - **Data term**: minimize `||δ(t)||²` (stay close to raw VIO solution)
+  - **Wall penalty**: for each pose, penalize `exp(-d(x,y)/σ)` where `d` is distance
+    transform value at the corrected (x,y) position (high cost near/inside walls)
+  - **Smoothness**: penalize `||δ''(t)||²` (drift correction should vary slowly)
+- Only correct x, y, yaw — roll/pitch/z pass through from VIO (z not evaluated)
+- Re-publish corrected trajectory; re-log TUM file
+- Validate: compare ATE with and without 3B on early-release GT runs
+
+### Phase 4: Evaluation and Submission
+- Run full pipeline on all 30 sequences
+- Batch-process with per-run config files
+- Verify coverage ≥99% for each run (auto-zero if below)
+- Submit TUM files at https://submit.hilti-challenge.com/
+
+---
+
+## Scoring Reference
+
+```
+score_per_run = (1/N) * sum( 100 * exp(-0.4605 * error_t) )   [capped at 100]
+
+final_score = sum of score_per_run across all runs
+  SLAM task:         max 2500 pts  (25 runs)
+  Localization task: max 2400 pts  (24 runs)
+```
+
+- Error of 0m → score 100; error of 10m → score 1
+- First 5 seconds of each run not evaluated (LiDAR GT starts later)
+- 6 runs have hidden error plots (score shown only)
+- z-coordinate not evaluated in Localization task
+- Scale not adjusted — ensure metric-scale trajectories
+
+---
+
+## Risks and Mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Topic name mismatch (OpenVINS vs VINS-Fusion) | Verify with `ros2 topic list` once running; thin adapter node if needed |
+| DBoW2 poor recall on textureless construction walls | Tune similarity threshold; LightGlue quality compensates for fewer candidates |
+| **BRIEF descriptors on fisheye (CONFIRMED)** | **Replaced by LightGlue service for geometric verification (Phase 2B)** |
+| LightGlue latency blocks loop closure | Async service call; loop closure is not on critical tracking path |
+| LightGlue GPU memory vs. OpenVINS | SuperPoint + LightGlue ~500 MB; OpenVINS tracking uses minimal GPU |
+| Floorplan as-built deviations | Use robust distance-transform penalty with outlier tolerance |
+| **Static init failure (CONFIRMED)** | **Play bags at 0.5x rate; add 6 s delay before downstream nodes start** |
+| Dynamic initialization on some runs | Tune OpenVINS `init_window_time` and `init_imu_thresh` |
+| ≥99% coverage requirement | Ensure bag playback is uninterrupted; check for dropped messages |
