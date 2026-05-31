@@ -25,6 +25,8 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 
 # Add include directories
 include_directories(
@@ -33,11 +35,25 @@ include_directories(
 )
 
 
+##############
+## Targets  ##
+##############
+
+add_executable(floorplan_localizer src/floorplan_localizer.cpp)
+ament_target_dependencies(floorplan_localizer
+  rclcpp nav_msgs ament_index_cpp)
+target_link_libraries(floorplan_localizer Eigen3::Eigen)
+
 #############
 ## Install ##
 #############
 
 ament_python_install_package(${PROJECT_NAME})
+
+install(TARGETS
+  floorplan_localizer
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 install(PROGRAMS
   challenge_tools_ros/bag_helper/image_stitching.py
