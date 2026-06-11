@@ -1,0 +1,46 @@
+{
+  "name": "Hilti SLAM Challenge",
+  "build": {
+    "context": "..",
+    "dockerfile": "../Dockerfile",
+    "args": {
+      "USER_UID": "${localEnv:UID:1000}",
+      "USER_GID": "${localEnv:GID:1000}",
+      "USERNAME": "${localEnv:USER:user}"
+    }
+  },
+  "remoteUser": "${localEnv:USER:user}",
+  "containerUser": "${localEnv:USER:user}",
+  "runArgs": [
+    "--gpus", "all",
+    "--network", "host"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/ros2_ws/src/hilti-trimble-slam-challenge-2026,type=bind",
+  "workspaceFolder": "/ros2_ws/src/hilti-trimble-slam-challenge-2026",
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/data,type=bind",
+    "source=${localEnv:HOME}/.ssh,target=/home/${localEnv:USER}/.ssh,type=bind,readonly"
+  ],
+  "postStartCommand": "bash -c 'source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash'",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "python.defaultInterpreterPath": "/usr/bin/python3"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-iros.vscode-ros",
+        "ms-vscode.cpptools"
+      ]
+    }
+  },
+  "remoteEnv": {
+    "ROS_DOMAIN_ID": "0",
+    "AMENT_PREFIX_PATH": "/ros2_ws/install/ov_msckf:/ros2_ws/install/ov_init:/ros2_ws/install/ov_eval:/ros2_ws/install/ov_data:/ros2_ws/install/ov_core:/ros2_ws/install/loop_fusion:/ros2_ws/install/camera_models:/ros2_ws/install/challenge_tools_ros:/opt/ros/humble",
+    "CMAKE_PREFIX_PATH": "/ros2_ws/install/ov_msckf/share/ov_msckf/cmake:/ros2_ws/install/ov_core/share/ov_core/cmake:/opt/ros/humble",
+    "COLCON_PREFIX_PATH": "/ros2_ws/install",
+    "LD_LIBRARY_PATH": "/ros2_ws/install/ov_msckf/lib:/ros2_ws/install/ov_core/lib:/ros2_ws/install/loop_fusion/lib:/ros2_ws/install/camera_models/lib:/opt/ros/humble/lib/x86_64-linux-gnu:/opt/ros/humble/lib:/usr/local/lib",
+    "PYTHONPATH": "/ros2_ws/install/challenge_tools_ros/lib/python3.10/site-packages:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages"
+  }
+}

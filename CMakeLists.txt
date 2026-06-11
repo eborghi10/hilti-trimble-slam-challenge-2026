@@ -17,7 +17,7 @@ set(PCL_FIND_QUIETLY ON)
 # ## System dependencies are found with CMake's conventions
 find_package(ament_cmake REQUIRED)
 find_package(cv_bridge REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 find_package(PCL REQUIRED COMPONENTS common io filters kdtree surface visualization)
 find_package(Eigen3 REQUIRED)
 find_package(pcl_conversions REQUIRED)
@@ -44,6 +44,13 @@ ament_target_dependencies(floorplan_localizer
   rclcpp nav_msgs ament_index_cpp)
 target_link_libraries(floorplan_localizer Eigen3::Eigen)
 
+find_package(Ceres REQUIRED)
+add_executable(floorplan_pose_graph src/floorplan_pose_graph.cpp)
+target_link_libraries(floorplan_pose_graph
+  Eigen3::Eigen
+  ${OpenCV_LIBS}
+  Ceres::ceres)
+
 #############
 ## Install ##
 #############
@@ -52,6 +59,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(TARGETS
   floorplan_localizer
+  floorplan_pose_graph
   DESTINATION lib/${PROJECT_NAME}
 )
 

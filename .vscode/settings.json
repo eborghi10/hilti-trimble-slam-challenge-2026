@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "ros2": true,
+        "timeout": true,
+        "/ros2_ws/install/challenge_tools_ros/lib/challenge_tools_ros/floorplan_pose_graph": true,
+        "colcon": true,
+        "evo_ape": true,
+        "/^python3 -c \"import gdown; print\\(gdown\\.__version__\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

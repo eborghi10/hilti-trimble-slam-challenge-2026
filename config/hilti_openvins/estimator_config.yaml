@@ -37,12 +37,12 @@ zupt_only_at_beginning: true
 # ==================================================================
 # ==================================================================
 
-init_window_time: 1.5 # make 2sec if using dynamic...
+init_window_time: 2.0 # make 2sec if using dynamic...
 init_imu_thresh: 0.4
 init_max_disparity: 15.0
 init_max_features: 50
 
-init_dyn_use: false
+init_dyn_use: true # enable dynamic init fallback for runs that start in motion
 init_dyn_mle_opt_calib: false
 init_dyn_mle_max_iter: 50
 init_dyn_mle_max_time: 0.05

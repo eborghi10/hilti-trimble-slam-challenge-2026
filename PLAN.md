@@ -78,9 +78,11 @@ Docker base: `nvidia/cuda:11.8.0-devel-ubuntu22.04`. GPU is optional at runtime 
 ### Floorplan Localization
 - Provided floorplans (PNG) converted to ROS2 OccupancyGrid via `map_server.py`
 - Initial GT camera pose provided at t≈10005s (5 sec after recording start)
-- 2D ICP or distance-transform scan-matching corrects x,y drift against wall geometry
+- Phase 3A: rigid transform from VIO frame to floorplan frame using GT anchor
+- Phase 3B: pose-graph optimization with EDT (Euclidean Distance Transform) map factors
+  corrects x,y,yaw drift against wall geometry — no explicit scan data needed
 - z-coordinate: pass-through from OpenVINS (not evaluated in Localization task)
-- Floorplan accuracy: ~1cm; as-built deviations expected — robust matching required
+- Floorplan accuracy: ~1cm; as-built deviations handled by robust EDT σ parameter
 
 ---
 
@@ -146,6 +148,14 @@ evo_ape tum groundtruth/floor_1_2025-05-05_run_1.txt \
 > for the first ~1 second of data. When replaying bags, play at **0.5x rate** with a
 > **6-second delay** before starting loop_fusion/other nodes to ensure reliable init.
 > Without this, VIO fails silently (outputs garbage poses or never converges).
+>
+> **Note**: Some runs start while the operator is already walking (no stationary
+> window) — static init never fires (logs show repeated
+> `[init]: not enough feats to compute disp`). Enable **dynamic initialization** as a
+> fallback in `config/hilti_openvins/estimator_config.yaml`: `init_dyn_use: true` and
+> `init_window_time: 2.0`. Then rebuild
+> (`colcon build --packages-select challenge_tools_ros --symlink-install`). The early
+> disp warnings are transient — VIO initializes once enough motion + features accumulate.
 
 ### Phase 2: Loop Closure ✓ *completed — SuperPoint ONNX C++ replaces BRIEF*
 
@@ -381,24 +391,181 @@ learned features handle this correctly.
 The gap between unaligned (0.61 m) and aligned (0.31 m) is VIO drift growing from
 the anchor point. Phase 3B aims to reduce this using floorplan geometry constraints.
 
-#### 3B: Free-space constraint optimization (drift correction)
-- Load floorplan PNG → binary occupancy grid + distance transform (cv2.distanceTransform)
-- After bag completes (or on a sliding window), optimize a smooth time-varying correction
-  `δ(t) = [δx, δy, δyaw]` parameterized as a cubic spline over time
-- Cost function:
-  - **Data term**: minimize `||δ(t)||²` (stay close to raw VIO solution)
-  - **Wall penalty**: for each pose, penalize `exp(-d(x,y)/σ)` where `d` is distance
-    transform value at the corrected (x,y) position (high cost near/inside walls)
-  - **Smoothness**: penalize `||δ''(t)||²` (drift correction should vary slowly)
-- Only correct x, y, yaw — roll/pitch/z pass through from VIO (z not evaluated)
-- Re-publish corrected trajectory; re-log TUM file
-- Validate: compare ATE with and without 3B on early-release GT runs
+#### 3B: Pose Graph + EDT Map Factors (drift correction)
 
-### Phase 4: Evaluation and Submission
-- Run full pipeline on all 30 sequences
-- Batch-process with per-run config files
-- Verify coverage ≥99% for each run (auto-zero if below)
-- Submit TUM files at https://submit.hilti-challenge.com/
+**Approach**: Post-process the Phase 3A trajectory using a 2D pose graph with Euclidean
+Distance Transform (EDT) map factors. The EDT precomputes distance-to-nearest-wall for
+every pixel, providing smooth gradients that push poses away from walls without requiring
+explicit scan data.
+
+**Implementation**: `src/floorplan_pose_graph.cpp` — offline batch optimizer
+(Ceres Solver, SPARSE_NORMAL_CHOLESKY). Runs in <1s for typical trajectories (~300 nodes).
+No ROS2 dependency — pure standalone executable.
+
+**Formulation**: Correction-based — optimizes δ[i] = [δx, δy, δyaw] per node (initialized
+to zero). Corrected pose = original + δ. This ensures:
+- Initial cost is minimal (corrections start at zero → odometry/smoothness cost = 0)
+- Smoothness penalizes correction jerk, not trajectory curvature
+- Only anchor prior and EDT factors pull corrections away from zero
+
+**Why C++ / Ceres (not Python / CUDA)**:
+- Ceres is already in the workspace (used by loop_fusion) — zero new dependencies
+- Sparse Cholesky on ~900 variables (300 nodes × 3 DOF) solves in milliseconds on CPU
+- CUDA would be overkill — bottleneck is optimizer structure, not raw compute
+- AutoDiff cost functions: no manual Jacobians for anchor/odometry/smoothness factors
+- NumericDiff for EDT factor (bilinear-interpolated lookup not analytically differentiable)
+
+**Architecture**:
+```
+Phase 3A trajectory (TUM, floorplan frame)
+  │
+  ├─ Subsample to pose graph nodes (1 node / 0.5s)
+  ├─ Load floorplan PNG → binary → cv::distanceTransform → bilinear EDT lookup
+  │
+  ├─ Ceres Problem (correction-based: δ[i] = [δx, δy, δyaw], init=0):
+  │    ├─ AnchorCost [AutoDiff, 3 residuals]:
+  │    │     strong prior at anchor node — (orig + δ) should match GT
+  │    ├─ OdometryCost [AutoDiff, 3 residuals]:
+  │    │     corrected relative pose should match VIO relative pose
+  │    ├─ EdtCost [NumericDiff, 1 residual]:
+  │    │     barrier: linear penalty when EDT(orig+δ) < margin (wall penetration)
+  │    └─ SmoothnessCost [AutoDiff, 3 residuals]:
+  │          second derivative of δ — penalizes correction jerk (not trajectory curvature)
+  │
+  ├─ Solver: SPARSE_NORMAL_CHOLESKY, 200 iterations, 4 threads
+  ├─ Interpolate δ corrections to full rate (linear between nodes)
+  └─ Output corrected TUM file (z, roll, pitch pass-through from VIO)
+```
+
+**Key parameters** (conservative defaults — prevent wall penetration without over-correcting):
+- `node_spacing = 0.5s` — one node per 0.5s (~2 Hz)
+- `anchor_weight = 1000.0` — strong prior on GT anchor
+- `odom_weight_xy = 50.0`, `odom_weight_yaw = 100.0` — odometry factors
+- `map_weight = 5.0`, `edt_margin = 0.05m` — EDT barrier (only prevents wall penetration)
+- `smoothness_weight = 10.0` — second-derivative regularization on corrections
+
+**Run command (Phase 3B)**:
+```bash
+# After Phase 3A produces the rigid-transform trajectory:
+/ros2_ws/install/challenge_tools_ros/lib/challenge_tools_ros/floorplan_pose_graph \
+  /ros2_ws/results/floor_1_2025-05-05_run_1_3a.txt \
+  floorplans/masks_no_windows/floor_1.png \
+  floor_1_2025-05-05_run_1 \
+  /ros2_ws/results/floor_1_2025-05-05_run_1_3b.txt
+
+# Evaluate improvement:
+evo_ape tum groundtruth/floor_1_2025-05-05_run_1.txt \
+  /ros2_ws/results/floor_1_2025-05-05_run_1_3b.txt \
+  -r trans_part
+```
+
+**Expected behavior**:
+- Near anchor (t≈10005s): corrections ≈ 0 (already pinned to GT)
+- Far from anchor: corrections grow to compensate VIO drift
+- Poses drifting into walls get pushed back into free-space
+- Wide-open areas: minimal correction (no wall signal → odom factor dominates)
+- Execution time: <1s per trajectory (34-65 iterations on 269 nodes)
+
+**Result** (floor_1_2025-05-05_run_1 — short trajectory with low drift):
+
+| Configuration | Max Correction | RMSE | vs Phase 3A |
+|---|---|---|---|
+| Phase 3A baseline (rigid transform only) | — | 0.611 m | — |
+| Default (margin=0.05m, conservative) | 0.18 m | 0.611 m | neutral |
+| Aggressive (margin=0.15m, map_weight=5) | 0.38 m | 0.658 m | -7.7% (worse) |
+| Attraction mode (sigma=0.5, map_weight=3) | 0.82 m | 0.674 m | -10.3% (worse) |
+
+**Conclusion for short runs**: On trajectories where drift < corridor width, the EDT
+factor cannot improve accuracy (it doesn't know *which direction* to correct, only that
+walls should be avoided). The optimizer correctly converges with near-zero corrections
+when using conservative defaults. Value will show on **longer runs** (floor_2, floor_UG1)
+where accumulated drift pushes poses through walls — the barrier will prevent this.
+
+**Limitations and future improvements**:
+- EDT-only cannot determine correction direction (only distance to wall, not which side)
+  → need additional signal for runs where drift doesn't cause wall penetrations
+- NumericDiff for EDT factor adds slight per-iteration cost (could use EDT gradient image)
+- Could add corridor width constraints (lateral constraint from parallel walls)
+- Could weight map factors by local EDT gradient magnitude (strong near wall edges)
+- For longer runs: increase edt_margin and map_weight to be more corrective
+
+### Phase 4: Evaluation and Submission ✓ *(all 30 runs processed — both submissions packaged)*
+
+**Batch automation**: `scripts/batch_process.sh` downloads each rosbag from Google Drive,
+runs the full pipeline (OpenVINS → loop_fusion → floorplan_localizer + trajectory_logger
+→ Phase 3B optimization), saves SLAM + Localization outputs, then deletes the bag to free
+disk space. Processes all 30 runs sequentially.
+
+**Run topology** (per run, all in one process group):
+```
+OpenVINS (stereo)  ─ /ov_msckf/odomimu ─┐
+                                         ├─→ loop_fusion ─ /loop_fusion/odometry_rect ─┬─→ floorplan_localizer → <run>_floorplan.txt → Phase 3B → results/localization/<run>.txt
+                                         │                                             └─→ trajectory_logger  → results/slam/<run>.txt
+```
+
+**Pipeline gotchas discovered & fixed** (see also `scripts/batch_process.sh`):
+1. **loop_fusion publishes on `/odometry_rect`** (no namespace). `run_loop_fusion.launch.py`
+   remaps it to `/loop_fusion/odometry_rect` so subscribers connect.
+2. **trajectory_logger.py needs `PYTHONPATH`** pointing at its install dir so it can import
+   `challenge_tools_lib` (sits beside it). Script exports this before launching.
+3. **OpenVINS must run in stereo** (`max_cameras:=2 use_stereo:=true`) — mono produced 0 poses
+   on these runs.
+4. **ONNX Runtime** must be on `LD_LIBRARY_PATH` for loop_fusion's SuperPoint
+   (`/ros2_ws/onnxruntime-linux-x64-gpu-1.17.1/lib`).
+5. image_conversion_node prints a NumPy/cv_bridge `_ARRAY_API` warning but functions correctly.
+6. **`((var++))` returns exit status 1 when `var` is 0** — under `set -e` this aborted the
+   script after the first completed run. Fixed by using `var=$((var + 1))` for the
+   `completed`/`failed` counters.
+7. **Suspending the host mid-run corrupts the in-flight run** — bag playback pauses, the
+   trajectory is truncated (and its bag may be auto-deleted). `systemd-inhibit` does NOT
+   work in this dev container (no dbus: "Failed to connect to bus"); disable suspend at the
+   host/OS level instead. Truncated runs must have their output deleted and be reprocessed.
+8. **Transient init/DDS failures** — a run can fail static/dynamic init once (0 poses) yet
+   succeed on a plain retry (`--only RUN_NAME`). Failed runs keep their bag for retry.
+
+**Config**: `PLAYBACK_RATE=0.5` (reliable static init), `INIT_WAIT=8s`, `BAG_PLAY_EXTRA=5s`.
+
+**CLI**:
+```bash
+./scripts/batch_process.sh [--start-from RUN_NAME] [--only RUN_NAME] [--slam-only] [--loc-only] [--keep-bags]
+```
+
+**Verified end-to-end** (floor_1_2025-05-05_run_1, local symlinked bag):
+- SLAM: 115,298 poses → `results/slam/floor_1_2025-05-05_run_1.txt`
+- Localization (3A): 121,005 poses → Phase 3B (Ceres cost 48.9→5.0, max correction 0.24m)
+  → `results/localization/floor_1_2025-05-05_run_1.txt`
+- Output timestamps align with GT (10001–10135 vs GT 10003–10134); start pose matches (~0.3m).
+
+**Verified download + process** (floor_1_2025-07-07_run_1, fresh from Google Drive):
+- Validates the full download path: gdown 3.8GB → metadata QoS fix → dynamic init → process.
+- SLAM: 121,738 poses; Localization (3A): 122,691 poses → Phase 3B (Ceres cost 60.5→6.25,
+  max correction dx=0.23m dy=0.51m dyaw=16.6°).
+- This run starts in motion → required `init_dyn_use: true` (see Phase 1 note above).
+
+**Full batch run ✓** — all 30 runs processed (SLAM + Localization), no truncated outputs:
+- First pass: 29/30 succeeded. Run 8 (`floor_2_2025-12-03_run_1`) was truncated when the
+  host was suspended mid-playback (11.8k poses); run 6 (`floor_2_2025-10-28_run_2`) hit a
+  transient init failure (0 poses).
+- Recovery: both reprocessed via `--only`. Run 8 → 132,823 SLAM / 135,798 loc poses;
+  run 6 → 80,610 SLAM / 80,888 loc poses (succeeded on plain retry).
+- Final: **30 SLAM + 30 Localization** trajectory files, all healthy (no file < 30k poses).
+
+**Submission packaging ✓**:
+- Package as **zip** of `.txt` files (flat, no subdirectories)
+- Each file: `floor_X_YYYY-MM-DD_run_Z.txt` in TUM format (`timestamp tx ty tz qx qy qz qw`)
+- Submit zip at https://submit.hilti-challenge.com/submission/new
+- Use `scripts/package_submission.py` (validates against the 30-run list + TUM format):
+  ```bash
+  python3 scripts/package_submission.py /ros2_ws/results/slam/         -o slam_submission.zip
+  python3 scripts/package_submission.py /ros2_ws/results/localization/ -o localization_submission.zip
+  ```
+- Both zips created at `/ros2_ws/results/{slam,localization}_submission.zip` (30 files each,
+  validated — no missing runs).
+
+**Remaining work**:
+- [ ] Upload both zips at https://submit.hilti-challenge.com/submission/new
+- [ ] `floor_UG2` floorplan is missing (only 9 floorplans present) — `floor_UG2_2025-12-02_run_1`
+      localization falls back to Phase 3A output (rigid transform only); still valid + included
 
 ---
 

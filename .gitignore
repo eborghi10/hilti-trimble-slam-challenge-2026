@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded rosbag input data
+2025-05-05/
+
+# Generated submission artifacts (trajectories + zips, large)
+submissions/
+
+# Build / results
+build/
+install/
+log/
+results/

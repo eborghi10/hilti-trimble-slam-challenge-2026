@@ -36,6 +36,8 @@ def launch_setup(context):
             ("/vins_estimator/keyframe_pose", "/ov_msckf/loop_pose"),
             ("/vins_estimator/keyframe_point", "/ov_msckf/loop_feats"),
             ("/vins_estimator/extrinsic", "/ov_msckf/loop_extrinsic"),
+            # Remap output topic to namespaced version
+            ("/odometry_rect", "/loop_fusion/odometry_rect"),
         ],
     )
 
